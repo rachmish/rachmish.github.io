@@ -1,0 +1,98 @@
+name: security-pipeline
+
+on: [push, workflow_dispatch]
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            returntocorp/semgrep semgrep scan --config=auto /src \
+            --json --output=/src/semgrep-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+
+  sca:
+    runs-on: ubuntu-latest
+    needs: sast
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy filesystem scan
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            aquasec/trivy fs /src --format json --output /src/trivy-sca-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sca-results
+          path: trivy-sca-results.json
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    needs: sca
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            zricethezav/gitleaks:latest detect --source=/src \
+            --report-path=/src/gitleaks-results.json --exit-code=0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-results
+          path: gitleaks-results.json
+
+  terraform-scan:
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" \
+            bridgecrew/checkov -d /src/terraform \
+            --output json --output-file-path /src/checkov-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkov-results
+          path: checkov-results.json
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: terraform-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build test image
+        run: docker build -t test-app:local ./src
+      - name: Run Trivy image scan
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}:/src" \
+            aquasec/trivy image test-app:local \
+            --format json --output /src/trivy-image-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results
+          path: trivy-image-results.json
+
+  compliance-gate:
+    runs-on: ubuntu-latest
+    needs: container-scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+      - name: Aggregate and gate
+        run: bash scripts/compliance-gate.sh results
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: compliance-gate
+    steps:
+      - name: Simulated deployment
+        run: echo "Compliance gate passed, deployment would proceed here"
